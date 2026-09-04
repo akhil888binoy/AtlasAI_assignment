@@ -12,7 +12,7 @@ from src.database.database import Base,DATABASE_URL
 from src.models.reconciliation_runs import ReconciliationRun
 from src.models.reconciliation_results import ReconciliationResult
 from src.models.field_differences import FieldDifference
-from src.models.manual_matches import ManualMatch
+from src.models.manual_decisions import ManualDecision
 from src.models.transactions import Transaction
 
 # import other models too

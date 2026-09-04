@@ -1,23 +1,23 @@
-from fastapi import APIRouter, UploadFile, File, Depends
-from sqlalchemy.orm import Session
+import hashlib
+import shutil
+from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
-import shutil
-from src.services.reconciliation import find_match, compare_transactions
-from src.models.reconciliation_results import ReconciliationResult
-from src.models.field_differences import FieldDifference
+
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session, selectinload
+
 from src.database.database import get_session
+from src.models.field_differences import FieldDifference
+from src.models.manual_decisions import ManualDecision
+from src.models.reconciliation_results import ReconciliationResult
 from src.models.reconciliation_runs import ReconciliationRun
 from src.models.transactions import Transaction
-from src.services.file_parser import (
-    parse_our_ledger,
-    parse_other_statement
-)
+from src.services.file_parser import parse_transactions
+from src.services.reconciliation import compare_transactions, find_match
 
-router = APIRouter(
-    prefix="/reconciliation",
-    tags=["Reconciliation"]
-)
+router = APIRouter(prefix="/reconciliation", tags=["Reconciliation"])
 
 UPLOAD_DIR = Path("uploads")
 OUR_LEDGER_DIR = UPLOAD_DIR / "our_ledger"
@@ -26,307 +26,343 @@ OTHER_STATEMENT_DIR = UPLOAD_DIR / "other_statements"
 OUR_LEDGER_DIR.mkdir(parents=True, exist_ok=True)
 OTHER_STATEMENT_DIR.mkdir(parents=True, exist_ok=True)
 
+COMPARED_FIELDS = ("timestamp", "instrument", "side", "quantity", "price", "amount")
+UNMATCHED_STATUSES = ("MISSING_ON_OTHER_SIDE", "MISSING_ON_OUR_SIDE")
+
+
+def file_hash(upload):
+    digest = hashlib.sha256(upload.file.read()).hexdigest()
+    upload.file.seek(0)
+    return digest
+
+
+def save_upload(upload, directory, run_id):
+    path = directory / f"{run_id}_{upload.filename}"
+    with open(path, "wb") as buffer:
+        shutil.copyfileobj(upload.file, buffer)
+    return path
+
 
 @router.post("/upload")
 async def upload_files(
     our_file: UploadFile = File(...),
     other_file: UploadFile = File(...),
-    db: Session = Depends(get_session)
+    db: Session = Depends(get_session),
 ):
+    our_hash = file_hash(our_file)
+    other_hash = file_hash(other_file)
 
-    # 1. Create reconciliation run
-    reconciliation_run = ReconciliationRun(
+    duplicate = (
+        db.query(ReconciliationRun)
+        .filter_by(our_file_hash=our_hash, other_file_hash=other_hash)
+        .first()
+    )
+    if duplicate:
+        raise HTTPException(
+            status_code=409,
+            detail=f"These exact files were already uploaded as run #{duplicate.id}.",
+        )
+
+    run = ReconciliationRun(
         created_at=datetime.utcnow(),
         our_file=our_file.filename,
         other_file=other_file.filename,
-        status="UPLOADED"
+        our_file_hash=our_hash,
+        other_file_hash=other_hash,
+        status="UPLOADED",
     )
+    db.add(run)
+    db.flush()
 
-    db.add(reconciliation_run)
-    db.commit()
-    db.refresh(reconciliation_run)
+    our_path = save_upload(our_file, OUR_LEDGER_DIR, run.id)
+    other_path = save_upload(other_file, OTHER_STATEMENT_DIR, run.id)
 
-    # 2. Save uploaded files
-    our_file_path = OUR_LEDGER_DIR / our_file.filename
-    other_file_path = OTHER_STATEMENT_DIR / other_file.filename
+    transactions = (
+        parse_transactions(our_path, "OUR_LEDGER")
+        + parse_transactions(other_path, "OTHER_STATEMENT")
+    )
+    for transaction in transactions:
+        db.add(Transaction(run_id=run.id, **transaction))
 
-    with open(our_file_path, "wb") as buffer:
-        shutil.copyfileobj(our_file.file, buffer)
-
-    with open(other_file_path, "wb") as buffer:
-        shutil.copyfileobj(other_file.file, buffer)
-
-    # 3. Parse and normalize our ledger
-    our_transactions = parse_our_ledger(our_file_path)
-
-    # 4. Parse and normalize other statement
-    other_transactions = parse_other_statement(other_file_path)
-
-    # 5. Remove cancelled transactions
-    our_transactions = [
-        transaction
-        for transaction in our_transactions
-        if transaction["status"] != "CANCELLED"
-    ]
-
-    other_transactions = [
-        transaction
-        for transaction in other_transactions
-        if transaction["status"] != "CANCELLED"
-    ]
-
-    # 6. Store our ledger transactions
-    for transaction in our_transactions:
-        db.add(
-            Transaction(
-                run_id=reconciliation_run.id,
-                **transaction
-            )
-        )
-
-    # 7. Store other statement transactions
-    for transaction in other_transactions:
-        db.add(
-            Transaction(
-                run_id=reconciliation_run.id,
-                **transaction
-            )
-        )
-
-    # 8. Mark ingestion as completed
-    reconciliation_run.status = "INGESTED"
-
+    run.status = "INGESTED"
     db.commit()
 
-    # 9. Return ingestion summary
     return {
-        "run_id": reconciliation_run.id,
-        "status": "INGESTED",
-        "our_transactions": len(our_transactions),
-        "other_transactions": len(other_transactions)
+        "run_id": run.id,
+        "status": run.status,
+        "our_transactions": sum(1 for t in transactions if t["source"] == "OUR_LEDGER"),
+        "other_transactions": sum(1 for t in transactions if t["source"] == "OTHER_STATEMENT"),
     }
+
 
 @router.post("/{run_id}/reconcile")
-def reconcile(
-    run_id: int,
-    db: Session = Depends(get_session)
-):
+def reconcile(run_id: int, db: Session = Depends(get_session)):
+    run = db.get(ReconciliationRun, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found.")
 
-    # 1. Get all transactions for this reconciliation run
-    transactions = (
-        db.query(Transaction)
-        .filter(Transaction.run_id == run_id)
-        .all()
-    )
+    # Re-running a run replaces its previous results.
+    db.query(ReconciliationResult).filter_by(run_id=run_id).delete()
 
-    # 2. Separate transactions by source
-    our_transactions = [
-        transaction
-        for transaction in transactions
-        if transaction.source == "OUR_LEDGER"
-    ]
+    transactions = db.query(Transaction).filter_by(run_id=run_id).all()
+    our_rows = [t for t in transactions if t.source == "OUR_LEDGER" and t.status == "ACTIVE"]
+    other_rows = [t for t in transactions if t.source == "OTHER_STATEMENT" and t.status == "ACTIVE"]
+    cancelled_rows = [t for t in transactions if t.status == "CANCELLED"]
 
-    other_transactions = [
-        transaction
-        for transaction in transactions
-        if transaction.source == "OTHER_STATEMENT"
-    ]
+    # Decisions people made on earlier runs still apply today.
+    decisions = db.query(ManualDecision).all()
+    manual_pairs = {
+        d.our_external_id: d.other_external_id
+        for d in decisions if d.our_external_id and d.other_external_id
+    }
+    accepted_ours = {d.our_external_id for d in decisions if not d.other_external_id}
+    accepted_others = {d.other_external_id for d in decisions if not d.our_external_id}
 
-    # 3. Keep track of transactions already matched
+    other_by_external_id = {t.external_id: t for t in other_rows}
     matched_other_ids = set()
+    statuses = Counter()
 
-    # 4. Initialize result counters
-    matched_count = 0
-    difference_count = 0
-    missing_on_other_side_count = 0
-    missing_on_our_side_count = 0
-
-    # 5. Match our transactions against the other statement
-    for our_transaction in our_transactions:
-
-        other_transaction = find_match(
-            our_transaction,
-            other_transactions,
-            matched_other_ids
-        )
-
-        # 6. No matching transaction found
-        if other_transaction is None:
-
-            result = ReconciliationResult(
-                run_id=run_id,
-                our_transaction_id=our_transaction.id,
-                other_transaction_id=None,
-                status="MISSING_ON_OTHER_SIDE"
-            )
-
-            db.add(result)
-
-            missing_on_other_side_count += 1
-
-            continue
-
-        # 7. Mark other transaction as matched
-        matched_other_ids.add(other_transaction.id)
-
-        # 8. Compare the matched transactions
-        status = compare_transactions(
-            our_transaction,
-            other_transaction
-        )
-
-        # 9. Save reconciliation result
+    def add_result(status, our=None, other=None, differences=()):
         result = ReconciliationResult(
             run_id=run_id,
-            our_transaction_id=our_transaction.id,
-            other_transaction_id=other_transaction.id,
-            status=status
+            our_transaction_id=our.id if our else None,
+            other_transaction_id=other.id if other else None,
+            status=status,
         )
-
         db.add(result)
         db.flush()
+        for difference in differences:
+            db.add(FieldDifference(result_id=result.id, **difference))
+        statuses[status] += 1
 
-        # 10. Update counters
-        if status == "MATCHED":
-
-            matched_count += 1
-
-        elif status == "DIFFERENCE":
-
-            difference_count += 1
-
-            # Save price difference
-            difference = FieldDifference(
-                result_id=result.id,
-                field_name="price",
-                our_value=str(our_transaction.price),
-                other_value=str(other_transaction.price),
-                difference=(
-                    other_transaction.price
-                    - our_transaction.price
-                )
-            )
-
-            db.add(difference)
-
-    # 11. Find transactions that exist only on the other side
-    for other_transaction in other_transactions:
-
-        if other_transaction.id in matched_other_ids:
+    for our in our_rows:
+        paired_id = manual_pairs.get(our.external_id)
+        other = other_by_external_id.get(paired_id) if paired_id else None
+        if other is not None and other.id not in matched_other_ids:
+            matched_other_ids.add(other.id)
+            add_result("MANUALLY_MATCHED", our, other, compare_transactions(our, other))
             continue
 
-        result = ReconciliationResult(
-            run_id=run_id,
-            our_transaction_id=None,
-            other_transaction_id=other_transaction.id,
-            status="MISSING_ON_OUR_SIDE"
-        )
+        if our.external_id in accepted_ours:
+            add_result("ACCEPTED_UNPAIRED", our=our)
+            continue
 
-        db.add(result)
+        other = find_match(our, other_rows, matched_other_ids)
+        if other is None:
+            add_result("MISSING_ON_OTHER_SIDE", our=our)
+            continue
 
-        missing_on_our_side_count += 1
+        matched_other_ids.add(other.id)
+        differences = compare_transactions(our, other)
+        add_result("DIFFERENCE" if differences else "MATCHED", our, other, differences)
 
-    # 12. Mark reconciliation run as completed
-    reconciliation_run = (
-        db.query(ReconciliationRun)
-        .filter(ReconciliationRun.id == run_id)
-        .first()
-    )
+    for other in other_rows:
+        if other.id in matched_other_ids:
+            continue
+        if other.external_id in accepted_others:
+            add_result("ACCEPTED_UNPAIRED", other=other)
+        else:
+            add_result("MISSING_ON_OUR_SIDE", other=other)
 
-    if reconciliation_run:
-        reconciliation_run.status = "RECONCILED"
+    # Cancelled rows are never compared, but the operator should see they were skipped.
+    for row in cancelled_rows:
+        if row.source == "OUR_LEDGER":
+            add_result("CANCELLED", our=row)
+        else:
+            add_result("CANCELLED", other=row)
 
-    # 13. Save all results
+    run.status = "RECONCILED"
     db.commit()
 
-    # 14. Return reconciliation summary
-    return {
-        "run_id": run_id,
-        "status": "RECONCILED",
-        "summary": {
-            "matched": matched_count,
-            "differences": difference_count,
-            "missing_on_other_side": missing_on_other_side_count,
-            "missing_on_our_side": missing_on_our_side_count
+    return {"run_id": run_id, "status": run.status, "summary": dict(statuses)}
+
+
+def get_unmatched_result(db, run_id, transaction_id):
+    """The result row for a transaction that is still missing its pair, or 400."""
+    result = (
+        db.query(ReconciliationResult)
+        .filter(
+            ReconciliationResult.run_id == run_id,
+            ReconciliationResult.status.in_(UNMATCHED_STATUSES),
+            or_(
+                ReconciliationResult.our_transaction_id == transaction_id,
+                ReconciliationResult.other_transaction_id == transaction_id,
+            ),
+        )
+        .first()
+    )
+    if result is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Only rows that are still unmatched can be resolved by hand.",
+        )
+    return result
+
+
+@router.post("/{run_id}/manual-match")
+def manual_match(
+    run_id: int,
+    our_transaction_id: int = Body(...),
+    other_transaction_id: int = Body(...),
+    resolved_by: str = Body("operator"),
+    db: Session = Depends(get_session),
+):
+    our_result = get_unmatched_result(db, run_id, our_transaction_id)
+    other_result = get_unmatched_result(db, run_id, other_transaction_id)
+
+    our = our_result.our_transaction
+    other = other_result.other_transaction
+    if our is None or other is None:
+        raise HTTPException(status_code=400, detail="Pick one row from each side.")
+
+    db.add(ManualDecision(
+        our_external_id=our.external_id,
+        other_external_id=other.external_id,
+        resolved_by=resolved_by,
+        resolved_at=datetime.utcnow(),
+    ))
+
+    our_result.other_transaction_id = other.id
+    our_result.status = "MANUALLY_MATCHED"
+    for difference in compare_transactions(our, other):
+        db.add(FieldDifference(result_id=our_result.id, **difference))
+    db.delete(other_result)
+    db.commit()
+
+    return {"result_id": our_result.id, "run_id": run_id, "status": our_result.status}
+
+
+@router.post("/{run_id}/accept-unpaired")
+def accept_unpaired(
+    run_id: int,
+    transaction_id: int = Body(...),
+    resolved_by: str = Body("operator"),
+    db: Session = Depends(get_session),
+):
+    result = get_unmatched_result(db, run_id, transaction_id)
+    transaction = result.our_transaction or result.other_transaction
+
+    decision = ManualDecision(resolved_by=resolved_by, resolved_at=datetime.utcnow())
+    if transaction.source == "OUR_LEDGER":
+        decision.our_external_id = transaction.external_id
+    else:
+        decision.other_external_id = transaction.external_id
+    db.add(decision)
+
+    result.status = "ACCEPTED_UNPAIRED"
+    db.commit()
+
+    return {"result_id": result.id, "run_id": run_id, "status": result.status}
+
+
+@router.get("/runs")
+def list_runs(db: Session = Depends(get_session)):
+    runs = db.query(ReconciliationRun).order_by(ReconciliationRun.id.desc()).all()
+
+    counts = (
+        db.query(ReconciliationResult.run_id, ReconciliationResult.status, func.count())
+        .group_by(ReconciliationResult.run_id, ReconciliationResult.status)
+        .all()
+    )
+    summaries = defaultdict(dict)
+    for run_id, status, count in counts:
+        summaries[run_id][status] = count
+
+    return [
+        {
+            "id": run.id,
+            "created_at": run.created_at,
+            "our_file": run.our_file,
+            "other_file": run.other_file,
+            "status": run.status,
+            "summary": summaries[run.id],
         }
+        for run in runs
+    ]
+
+
+def previous_versions(db, run_id, external_ids):
+    """The most recent earlier copy of each trade, keyed by (source, external_id).
+
+    Answers "what did this row say before the correction?".
+    """
+    earlier = (
+        db.query(Transaction)
+        .filter(Transaction.run_id < run_id, Transaction.external_id.in_(external_ids))
+        .order_by(Transaction.run_id.desc())
+        .all()
+    )
+    versions = {}
+    for transaction in earlier:
+        versions.setdefault((transaction.source, transaction.external_id), transaction)
+    return versions
+
+
+def transaction_json(transaction, versions):
+    if transaction is None:
+        return None
+
+    before = versions.get((transaction.source, transaction.external_id))
+    changed = {} if before is None else {
+        field: getattr(before, field)
+        for field in COMPARED_FIELDS
+        if getattr(before, field) != getattr(transaction, field)
     }
 
-@router.get("/{run_id}/results")
-def get_results(
-    run_id: int,
-    db: Session = Depends(get_session)
-):
+    return {
+        "id": transaction.id,
+        "external_id": transaction.external_id,
+        "timestamp": transaction.timestamp,
+        "instrument": transaction.instrument,
+        "side": transaction.side,
+        "quantity": transaction.quantity,
+        "price": transaction.price,
+        "amount": transaction.amount,
+        "status": transaction.status,
+        "previous_values": changed,
+    }
 
-    # Get all reconciliation results for this run
+
+@router.get("/{run_id}/results")
+def get_results(run_id: int, db: Session = Depends(get_session)):
     results = (
         db.query(ReconciliationResult)
-        .filter(ReconciliationResult.run_id == run_id)
+        .filter_by(run_id=run_id)
+        .options(
+            selectinload(ReconciliationResult.our_transaction),
+            selectinload(ReconciliationResult.other_transaction),
+            selectinload(ReconciliationResult.differences),
+        )
+        .order_by(ReconciliationResult.id)
         .all()
     )
 
-    response = []
-
-    for result in results:
-
-        our_transaction = None
-        other_transaction = None
-
-        # Get our transaction
-        if result.our_transaction_id is not None:
-            our_transaction = (
-                db.query(Transaction)
-                .filter(
-                    Transaction.id == result.our_transaction_id
-                )
-                .first()
-            )
-
-        # Get other transaction
-        if result.other_transaction_id is not None:
-            other_transaction = (
-                db.query(Transaction)
-                .filter(
-                    Transaction.id == result.other_transaction_id
-                )
-                .first()
-            )
-
-        response.append({
-            "result_id": result.id,
-            "status": result.status,
-
-            "our_transaction": (
-                {
-                    "id": our_transaction.id,
-                    "external_id": our_transaction.external_id,
-                    "timestamp": our_transaction.timestamp,
-                    "instrument": our_transaction.instrument,
-                    "side": our_transaction.side,
-                    "quantity": our_transaction.quantity,
-                    "price": our_transaction.price,
-                    "amount": our_transaction.amount
-                }
-                if our_transaction
-                else None
-            ),
-
-            "other_transaction": (
-                {
-                    "id": other_transaction.id,
-                    "external_id": other_transaction.external_id,
-                    "timestamp": other_transaction.timestamp,
-                    "instrument": other_transaction.instrument,
-                    "side": other_transaction.side,
-                    "quantity": other_transaction.quantity,
-                    "price": other_transaction.price,
-                    "amount": other_transaction.amount
-                }
-                if other_transaction
-                else None
-            )
-        })
+    external_ids = {
+        t.external_id
+        for result in results
+        for t in (result.our_transaction, result.other_transaction)
+        if t is not None
+    }
+    versions = previous_versions(db, run_id, external_ids)
 
     return {
         "run_id": run_id,
-        "results": response
+        "results": [
+            {
+                "result_id": result.id,
+                "status": result.status,
+                "our_transaction": transaction_json(result.our_transaction, versions),
+                "other_transaction": transaction_json(result.other_transaction, versions),
+                "differences": [
+                    {
+                        "field_name": d.field_name,
+                        "our_value": d.our_value,
+                        "other_value": d.other_value,
+                        "difference": d.difference,
+                    }
+                    for d in result.differences
+                ],
+            }
+            for result in results
+        ],
     }

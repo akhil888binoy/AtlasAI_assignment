@@ -10,4 +10,7 @@ class ReconciliationRun(Base):
     created_at = Column(DateTime, nullable=False)
     our_file = Column(String, nullable=False)
     other_file = Column(String, nullable=False)
+    # Content hashes, used to spot the same pair of files being sent twice.
+    our_file_hash = Column(String, nullable=True)
+    other_file_hash = Column(String, nullable=True)
     status = Column(String, nullable=False)
