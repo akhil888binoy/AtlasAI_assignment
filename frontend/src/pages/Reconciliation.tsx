@@ -1,24 +1,13 @@
-import { useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
-type UploadResponse = {
-  run_id: number;
-  status: string;
-  our_transactions: number;
-  other_transactions: number;
-};
-
-type Summary = {
-  matched: number;
-  differences: number;
-  missing_on_other_side: number;
-  missing_on_our_side: number;
-};
-
-type ReconcileResponse = {
-  run_id: number;
-  status: string;
-  summary: Summary;
-};
+type Status =
+  | "MATCHED"
+  | "DIFFERENCE"
+  | "MISSING_ON_OTHER_SIDE"
+  | "MISSING_ON_OUR_SIDE"
+  | "MANUALLY_MATCHED"
+  | "ACCEPTED_UNPAIRED"
+  | "CANCELLED";
 
 type Transaction = {
   id: number;
@@ -29,383 +18,309 @@ type Transaction = {
   quantity: number;
   price: number;
   amount: number;
+  status: string;
+  // What this trade said in an earlier run, for fields a correction changed.
+  previous_values: Partial<Record<string, string | number>>;
+};
+
+type Difference = {
+  field_name: string;
+  our_value: string;
+  other_value: string;
+  difference: number;
 };
 
 type ResultRow = {
   result_id: number;
-  status:
-    | "MATCHED"
-    | "DIFFERENCE"
-    | "MISSING_ON_OTHER_SIDE"
-    | "MISSING_ON_OUR_SIDE";
+  status: Status;
   our_transaction: Transaction | null;
   other_transaction: Transaction | null;
+  differences: Difference[];
 };
 
-type ResultsResponse = {
-  run_id: number;
-  results: ResultRow[];
+type Run = {
+  id: number;
+  created_at: string;
+  our_file: string;
+  other_file: string;
+  status: string;
+  summary: Partial<Record<Status, number>>;
 };
 
-type RequestState = "idle" | "uploading" | "reconciling" | "loading-results";
-type Filter = "ALL" | ResultRow["status"];
+type Filter = "ATTENTION" | "ALL" | Status;
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "";
-
-const emptySummary: Summary = {
-  matched: 0,
-  differences: 0,
-  missing_on_other_side: 0,
-  missing_on_our_side: 0,
+const STATUS: Record<Status, { label: string; tone: string }> = {
+  MATCHED: { label: "Matched", tone: "bg-emerald-100 text-emerald-800" },
+  DIFFERENCE: { label: "Difference", tone: "bg-amber-100 text-amber-800" },
+  MISSING_ON_OTHER_SIDE: { label: "Missing external", tone: "bg-red-100 text-red-800" },
+  MISSING_ON_OUR_SIDE: { label: "Missing internal", tone: "bg-sky-100 text-sky-800" },
+  MANUALLY_MATCHED: { label: "Manual match", tone: "bg-violet-100 text-violet-800" },
+  ACCEPTED_UNPAIRED: { label: "Accepted unpaired", tone: "bg-slate-200 text-slate-700" },
+  CANCELLED: { label: "Cancelled", tone: "bg-slate-100 text-slate-500" },
 };
 
-const statusLabels: Record<ResultRow["status"], string> = {
-  MATCHED: "Matched",
-  DIFFERENCE: "Difference",
-  MISSING_ON_OTHER_SIDE: "Missing external",
-  MISSING_ON_OUR_SIDE: "Missing internal",
-};
+const STATUS_ORDER = Object.keys(STATUS) as Status[];
+const NEEDS_ATTENTION: Status[] = ["DIFFERENCE", "MISSING_ON_OTHER_SIDE", "MISSING_ON_OUR_SIDE"];
+const MISSING: Status[] = ["MISSING_ON_OTHER_SIDE", "MISSING_ON_OUR_SIDE"];
 
-const filterOptions: Array<{ value: Filter; label: string }> = [
-  { value: "ALL", label: "All" },
-  { value: "MATCHED", label: "Matched" },
-  { value: "DIFFERENCE", label: "Differences" },
-  { value: "MISSING_ON_OTHER_SIDE", label: "Missing external" },
-  { value: "MISSING_ON_OUR_SIDE", label: "Missing internal" },
-];
+const FIELDS = [
+  { key: "external_id", label: "Reference" },
+  { key: "timestamp", label: "Time" },
+  { key: "instrument", label: "Instrument" },
+  { key: "side", label: "Side" },
+  { key: "quantity", label: "Quantity" },
+  { key: "price", label: "Price" },
+  { key: "amount", label: "Amount" },
+] as const;
 
-function formatMoney(value?: number) {
-  if (value === undefined) return "-";
-
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: 2,
-  }).format(value);
+function formatValue(value: string | number | undefined) {
+  if (value === undefined || value === null) return "-";
+  if (typeof value === "number") {
+    return new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 }).format(value);
+  }
+  // Timestamps arrive as ISO strings; show them as sent, no timezone guessing.
+  return value.replace("T", " ").slice(0, 19);
 }
 
-function formatNumber(value?: number) {
-  if (value === undefined) return "-";
-
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: 8,
-  }).format(value);
+function formatGap(difference: Difference) {
+  if (difference.field_name === "timestamp") {
+    const minutes = difference.difference / 60;
+    return `${minutes > 0 ? "+" : ""}${formatValue(minutes)} min`;
+  }
+  return `${difference.difference > 0 ? "+" : ""}${formatValue(difference.difference)}`;
 }
 
-function formatDate(value?: string) {
-  if (!value) return "-";
-
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-
-  return date.toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-function getPriceDifference(row: ResultRow) {
-  if (!row.our_transaction || !row.other_transaction) return undefined;
-
-  return row.other_transaction.price - row.our_transaction.price;
-}
-
-function getActionLabel(requestState: RequestState) {
-  if (requestState === "uploading") return "Uploading files...";
-  if (requestState === "reconciling") return "Reconciling...";
-  if (requestState === "loading-results") return "Loading results...";
-
-  return "Run reconciliation";
-}
-
-async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, options);
+async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(`/reconciliation${path}`, options);
 
   if (!response.ok) {
-    let message = `Request failed with status ${response.status}`;
-
-    try {
-      const body = await response.json();
-      message = body.detail ?? message;
-    } catch {
-      // Keep the status-based message when the server does not return JSON.
-    }
-
-    throw new Error(message);
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.detail ?? `Request failed with status ${response.status}`);
   }
 
   return response.json();
 }
 
+function postJson<T>(path: string, body: object) {
+  return api<T>(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 function Reconciliation() {
-  const [ourFile, setOurFile] = useState<File | null>(null);
-  const [otherFile, setOtherFile] = useState<File | null>(null);
-  const [upload, setUpload] = useState<UploadResponse | null>(null);
-  const [reconciliation, setReconciliation] =
-    useState<ReconcileResponse | null>(null);
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [runId, setRunId] = useState<number | null>(null);
   const [results, setResults] = useState<ResultRow[]>([]);
-  const [filter, setFilter] = useState<Filter>("ALL");
-  const [requestState, setRequestState] = useState<RequestState>("idle");
+  const [filter, setFilter] = useState<Filter>("ATTENTION");
+  const [selectedResultId, setSelectedResultId] = useState<number | null>(null);
+  // Rows picked for a manual match, one per side.
+  const [pickedOur, setPickedOur] = useState<Transaction | null>(null);
+  const [pickedOther, setPickedOther] = useState<Transaction | null>(null);
+  const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
-  const isBusy = requestState !== "idle";
-  const hasResults = results.length > 0;
+  const selectedRow = results.find((row) => row.result_id === selectedResultId) ?? null;
 
-  const filteredResults = useMemo(() => {
-    if (filter === "ALL") return results;
+  const visibleRows = results.filter((row) => {
+    if (filter === "ALL") return true;
+    if (filter === "ATTENTION") return NEEDS_ATTENTION.includes(row.status);
+    return row.status === filter;
+  });
 
-    return results.filter((row) => row.status === filter);
-  }, [filter, results]);
+  const counts = results.reduce<Partial<Record<Status, number>>>((acc, row) => {
+    acc[row.status] = (acc[row.status] ?? 0) + 1;
+    return acc;
+  }, {});
 
-  const totals = useMemo(() => {
-    if (reconciliation?.summary) return reconciliation.summary;
+  async function loadRuns() {
+    const data = await api<Run[]>("/runs");
+    setRuns(data);
+    return data;
+  }
 
-    return results.reduce<Summary>((summary, row) => {
-      if (row.status === "MATCHED") summary.matched += 1;
-      if (row.status === "DIFFERENCE") summary.differences += 1;
-      if (row.status === "MISSING_ON_OTHER_SIDE") {
-        summary.missing_on_other_side += 1;
-      }
-      if (row.status === "MISSING_ON_OUR_SIDE") {
-        summary.missing_on_our_side += 1;
-      }
+  async function openRun(id: number) {
+    setRunId(id);
+    setSelectedResultId(null);
+    setPickedOur(null);
+    setPickedOther(null);
+    const data = await api<{ results: ResultRow[] }>(`/${id}/results`);
+    setResults(data.results);
+  }
 
-      return summary;
-    }, { ...emptySummary });
-  }, [reconciliation, results]);
+  // Refresh the current run's rows after a hand resolution.
+  async function refreshResults() {
+    if (runId === null) return;
+    const data = await api<{ results: ResultRow[] }>(`/${runId}/results`);
+    setResults(data.results);
+    await loadRuns();
+  }
 
-  const exceptionCount =
-    totals.differences +
-    totals.missing_on_other_side +
-    totals.missing_on_our_side;
+  useEffect(() => {
+    loadRuns()
+      .then((data) => data[0] && openRun(data[0].id))
+      .catch((err) => setError(err.message));
+  }, []);
 
-  const completionRate =
-    results.length === 0 ? 0 : Math.round((totals.matched / results.length) * 100);
-
-  const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-
-    if (!ourFile || !otherFile) {
-      setError("Select both CSV files before starting reconciliation.");
-      return;
-    }
-
+  async function withBusy(label: string, work: () => Promise<void>) {
+    setBusy(label);
     setError("");
-    setUpload(null);
-    setReconciliation(null);
-    setResults([]);
-    setFilter("ALL");
+    try {
+      await work();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong.");
+    } finally {
+      setBusy("");
+    }
+  }
 
+  function startRun(ourFile: File, otherFile: File) {
     const formData = new FormData();
     formData.append("our_file", ourFile);
     formData.append("other_file", otherFile);
 
-    try {
-      setRequestState("uploading");
-      const uploadData = await apiRequest<UploadResponse>(
-        "/reconciliation/upload",
-        {
-          method: "POST",
-          body: formData,
-        },
-      );
-      setUpload(uploadData);
+    return withBusy("Running...", async () => {
+      const upload = await api<{ run_id: number }>("/upload", { method: "POST", body: formData });
+      await api(`/${upload.run_id}/reconcile`, { method: "POST" });
+      await loadRuns();
+      await openRun(upload.run_id);
+    });
+  }
 
-      setRequestState("reconciling");
-      const reconcileData = await apiRequest<ReconcileResponse>(
-        `/reconciliation/${uploadData.run_id}/reconcile`,
-        { method: "POST" },
-      );
-      setReconciliation(reconcileData);
+  function acceptUnpaired(transaction: Transaction) {
+    return withBusy("Saving...", async () => {
+      await postJson(`/${runId}/accept-unpaired`, { transaction_id: transaction.id });
+      await refreshResults();
+    });
+  }
 
-      setRequestState("loading-results");
-      const resultsData = await apiRequest<ResultsResponse>(
-        `/reconciliation/${uploadData.run_id}/results`,
-      );
-      setResults(resultsData.results);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong.");
-    } finally {
-      setRequestState("idle");
-    }
-  };
+  function pickForMatch(row: ResultRow) {
+    if (row.our_transaction) setPickedOur(row.our_transaction);
+    if (row.other_transaction) setPickedOther(row.other_transaction);
+  }
+
+  function confirmManualMatch() {
+    if (!pickedOur || !pickedOther) return;
+    return withBusy("Matching...", async () => {
+      await postJson(`/${runId}/manual-match`, {
+        our_transaction_id: pickedOur.id,
+        other_transaction_id: pickedOther.id,
+      });
+      setPickedOur(null);
+      setPickedOther(null);
+      setSelectedResultId(null);
+      await refreshResults();
+    });
+  }
 
   return (
     <main className="min-h-screen bg-[#f7f8fb] text-slate-950">
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl flex-col gap-6 px-5 py-7 sm:px-8 lg:flex-row lg:items-end lg:justify-between">
-          <div>
-            <div className="inline-flex items-center gap-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-1 text-xs font-semibold uppercase text-slate-600">
-              <span className="h-2 w-2 rounded-full bg-emerald-500" />
-              Reconciliation workspace
-            </div>
-            <h1 className="mt-4 text-3xl font-semibold text-slate-950 sm:text-4xl">
-              Transaction reconciliation
-            </h1>
-            <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-600">
-              Upload the internal ledger and external statement, run automated
-              matching, then review every matched trade and exception.
-            </p>
-          </div>
-
-          <RunStatus upload={upload} reconciliation={reconciliation} />
+        <div className="mx-auto max-w-7xl px-5 py-6 sm:px-8">
+          <h1 className="text-2xl font-semibold">Transaction reconciliation</h1>
+          <p className="mt-1 text-sm text-slate-600">
+            Upload today's ledger and statement, then work through the rows that do not agree.
+          </p>
         </div>
       </header>
 
-      <section className="mx-auto grid max-w-7xl gap-6 px-5 py-6 sm:px-8 lg:grid-cols-[380px_1fr]">
+      <div className="mx-auto grid max-w-7xl gap-6 px-5 py-6 sm:px-8 lg:grid-cols-[320px_1fr]">
         <aside className="space-y-4">
-          <form
-            onSubmit={handleSubmit}
-            className="rounded-md border border-slate-200 bg-white p-5 shadow-sm"
-          >
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <h2 className="text-lg font-semibold">Input files</h2>
-                <p className="mt-1 text-sm text-slate-500">
-                  CSV uploads are processed together as one run.
-                </p>
-              </div>
-              <span className="rounded bg-slate-100 px-2 py-1 text-xs font-medium text-slate-600">
-                CSV
-              </span>
-            </div>
-
-            <div className="mt-5 space-y-3">
-              <FilePicker
-                id="our-ledger"
-                label="Internal ledger"
-                file={ourFile}
-                onChange={setOurFile}
-              />
-              <FilePicker
-                id="other-statement"
-                label="External statement"
-                file={otherFile}
-                onChange={setOtherFile}
-              />
-            </div>
-
-            {error && (
-              <div className="mt-4 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
-                {error}
-              </div>
-            )}
-
-            <button
-              type="submit"
-              disabled={isBusy}
-              className="mt-5 flex w-full items-center justify-center gap-2 rounded-md bg-slate-950 px-4 py-3 text-sm font-semibold text-white shadow-sm hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
-            >
-              {isBusy && (
-                <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/40 border-t-white" />
-              )}
-              {getActionLabel(requestState)}
-            </button>
-          </form>
-
-          <ProcessPanel requestState={requestState} upload={upload} />
+          <UploadForm busy={busy} onSubmit={startRun} />
+          <RunList runs={runs} activeRunId={runId} onOpen={(id) => withBusy("Loading...", () => openRun(id))} />
         </aside>
 
-        <section className="space-y-6">
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <SummaryCard label="Matched" value={totals.matched} tone="green" />
-            <SummaryCard
-              label="Differences"
-              value={totals.differences}
-              tone="amber"
-            />
-            <SummaryCard
-              label="Missing external"
-              value={totals.missing_on_other_side}
-              tone="red"
-            />
-            <SummaryCard
-              label="Missing internal"
-              value={totals.missing_on_our_side}
-              tone="blue"
-            />
-          </div>
-
-          <div className="grid gap-4 lg:grid-cols-[1fr_280px]">
-            <div className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <h2 className="text-base font-semibold">Match quality</h2>
-                  <p className="mt-1 text-sm text-slate-500">
-                    {hasResults
-                      ? `${completionRate}% of result rows matched cleanly`
-                      : "Run reconciliation to calculate the match rate"}
-                  </p>
-                </div>
-                <div className="text-right">
-                  <div className="text-2xl font-semibold">{completionRate}%</div>
-                  <div className="text-xs font-medium uppercase text-slate-500">
-                    Matched
-                  </div>
-                </div>
-              </div>
-              <div className="mt-4 h-2 overflow-hidden rounded-full bg-slate-100">
-                <div
-                  className="h-full rounded-full bg-emerald-500"
-                  style={{ width: `${completionRate}%` }}
-                />
-              </div>
+        <section className="space-y-4">
+          {error && (
+            <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+              {error}
             </div>
+          )}
 
-            <div className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
-              <div className="text-sm font-medium text-slate-500">
-                Exceptions
-              </div>
-              <div className="mt-2 text-3xl font-semibold">{exceptionCount}</div>
-              <p className="mt-2 text-sm leading-5 text-slate-500">
-                Rows requiring manual review after automated matching.
-              </p>
-            </div>
+          {(pickedOur || pickedOther) && (
+            <MatchBar
+              pickedOur={pickedOur}
+              pickedOther={pickedOther}
+              busy={busy}
+              onConfirm={confirmManualMatch}
+              onClear={() => {
+                setPickedOur(null);
+                setPickedOther(null);
+              }}
+            />
+          )}
+
+          <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-7">
+            {STATUS_ORDER.map((status) => (
+              <button
+                key={status}
+                type="button"
+                onClick={() => setFilter(status)}
+                className={`rounded-md border p-3 text-left shadow-sm ${
+                  filter === status ? "border-slate-950" : "border-slate-200"
+                } ${STATUS[status].tone}`}
+              >
+                <div className="text-xs font-medium">{STATUS[status].label}</div>
+                <div className="mt-1 text-2xl font-semibold">{counts[status] ?? 0}</div>
+              </button>
+            ))}
           </div>
 
           <ResultsTable
+            rows={visibleRows}
+            total={results.length}
             filter={filter}
-            filteredResults={filteredResults}
-            hasResults={hasResults}
-            results={results}
             setFilter={setFilter}
+            selectedResultId={selectedResultId}
+            onSelect={setSelectedResultId}
           />
+
+          {selectedRow && (
+            <RowDetail
+              row={selectedRow}
+              busy={busy}
+              onAcceptUnpaired={acceptUnpaired}
+              onPickForMatch={pickForMatch}
+            />
+          )}
         </section>
-      </section>
+      </div>
     </main>
   );
 }
 
-function RunStatus({
-  upload,
-  reconciliation,
+function UploadForm({
+  busy,
+  onSubmit,
 }: {
-  upload: UploadResponse | null;
-  reconciliation: ReconcileResponse | null;
+  busy: string;
+  onSubmit: (ourFile: File, otherFile: File) => void;
 }) {
-  if (!upload) {
-    return (
-      <div className="rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-600">
-        No run started
-      </div>
-    );
-  }
+  const [ourFile, setOurFile] = useState<File | null>(null);
+  const [otherFile, setOtherFile] = useState<File | null>(null);
 
   return (
-    <div className="min-w-44 rounded-md border border-slate-200 bg-slate-50 px-4 py-3 text-sm">
-      <div className="flex items-center justify-between gap-4">
-        <span className="font-medium text-slate-500">Run</span>
-        <span className="font-semibold text-slate-950">#{upload.run_id}</span>
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (ourFile && otherFile) onSubmit(ourFile, otherFile);
+      }}
+      className="rounded-md border border-slate-200 bg-white p-4 shadow-sm"
+    >
+      <h2 className="text-base font-semibold">Start a run</h2>
+      <div className="mt-3 space-y-2">
+        <FilePicker id="our-file" label="Our ledger" file={ourFile} onChange={setOurFile} />
+        <FilePicker id="other-file" label="Their statement" file={otherFile} onChange={setOtherFile} />
       </div>
-      <div className="mt-2 flex items-center justify-between gap-4">
-        <span className="font-medium text-slate-500">Status</span>
-        <span className="rounded bg-emerald-100 px-2 py-1 text-xs font-semibold text-emerald-800">
-          {reconciliation?.status ?? upload.status}
-        </span>
-      </div>
-    </div>
+      <button
+        type="submit"
+        disabled={busy !== "" || !ourFile || !otherFile}
+        className="mt-4 w-full rounded-md bg-slate-950 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+      >
+        {busy || "Upload and reconcile"}
+      </button>
+    </form>
   );
 }
 
@@ -423,19 +338,10 @@ function FilePicker({
   return (
     <label
       htmlFor={id}
-      className="block cursor-pointer rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 py-4 hover:border-slate-400 hover:bg-white"
+      className="block cursor-pointer rounded-md border border-dashed border-slate-300 bg-slate-50 px-3 py-2.5 hover:border-slate-400 hover:bg-white"
     >
-      <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0">
-          <div className="text-sm font-semibold text-slate-800">{label}</div>
-          <div className="mt-1 truncate text-sm text-slate-500">
-            {file ? file.name : "Choose a CSV file"}
-          </div>
-        </div>
-        <span className="shrink-0 rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium text-slate-700">
-          Browse
-        </span>
-      </div>
+      <div className="text-sm font-semibold text-slate-800">{label}</div>
+      <div className="mt-0.5 truncate text-sm text-slate-500">{file ? file.name : "Choose a CSV file"}</div>
       <input
         id={id}
         type="file"
@@ -447,244 +353,286 @@ function FilePicker({
   );
 }
 
-function ProcessPanel({
-  requestState,
-  upload,
+function RunList({
+  runs,
+  activeRunId,
+  onOpen,
 }: {
-  requestState: RequestState;
-  upload: UploadResponse | null;
+  runs: Run[];
+  activeRunId: number | null;
+  onOpen: (id: number) => void;
 }) {
-  const steps = [
-    {
-      label: "Upload files",
-      done: Boolean(upload),
-      active: requestState === "uploading",
-    },
-    {
-      label: "Run matcher",
-      done: upload?.status === "INGESTED" || upload?.status === "RECONCILED",
-      active: requestState === "reconciling",
-    },
-    {
-      label: "Load review table",
-      done: requestState === "idle" && Boolean(upload),
-      active: requestState === "loading-results",
-    },
-  ];
-
   return (
-    <div className="rounded-md border border-slate-200 bg-white p-5 shadow-sm">
-      <h2 className="text-base font-semibold">Run progress</h2>
-      <div className="mt-4 space-y-3">
-        {steps.map((step) => (
-          <div key={step.label} className="flex items-center gap-3">
-            <span
-              className={`flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
-                step.done
-                  ? "bg-emerald-100 text-emerald-700"
-                  : step.active
-                    ? "bg-slate-950 text-white"
-                    : "bg-slate-100 text-slate-400"
-              }`}
-            >
-              {step.done ? "OK" : ""}
-            </span>
-            <span
-              className={`text-sm ${
-                step.active ? "font-semibold text-slate-950" : "text-slate-600"
-              }`}
-            >
-              {step.label}
-            </span>
-          </div>
-        ))}
-      </div>
+    <div className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
+      <h2 className="text-base font-semibold">Previous runs</h2>
+      {runs.length === 0 && <p className="mt-2 text-sm text-slate-500">No runs yet.</p>}
+      <ul className="mt-3 space-y-2">
+        {runs.map((run) => {
+          const open = NEEDS_ATTENTION.reduce((sum, status) => sum + (run.summary[status] ?? 0), 0);
+          return (
+            <li key={run.id}>
+              <button
+                type="button"
+                onClick={() => onOpen(run.id)}
+                className={`w-full rounded-md border px-3 py-2 text-left text-sm hover:bg-slate-50 ${
+                  run.id === activeRunId ? "border-slate-950 bg-slate-50" : "border-slate-200"
+                }`}
+              >
+                <div className="flex justify-between font-semibold">
+                  <span>Run #{run.id}</span>
+                  <span className={open > 0 ? "text-amber-700" : "text-emerald-700"}>
+                    {open} open
+                  </span>
+                </div>
+                <div className="mt-0.5 text-xs text-slate-500">{formatValue(run.created_at)}</div>
+                <div className="mt-0.5 truncate text-xs text-slate-500">
+                  {run.our_file} + {run.other_file}
+                </div>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
 
-function SummaryCard({
-  label,
-  value,
-  tone,
+function MatchBar({
+  pickedOur,
+  pickedOther,
+  busy,
+  onConfirm,
+  onClear,
 }: {
-  label: string;
-  value: number;
-  tone: "green" | "amber" | "red" | "blue";
+  pickedOur: Transaction | null;
+  pickedOther: Transaction | null;
+  busy: string;
+  onConfirm: () => void;
+  onClear: () => void;
 }) {
-  const tones = {
-    green: "border-emerald-200 bg-emerald-50 text-emerald-800",
-    amber: "border-amber-200 bg-amber-50 text-amber-800",
-    red: "border-red-200 bg-red-50 text-red-800",
-    blue: "border-sky-200 bg-sky-50 text-sky-800",
-  };
-
   return (
-    <div className={`rounded-md border p-4 shadow-sm ${tones[tone]}`}>
-      <div className="text-sm font-medium">{label}</div>
-      <div className="mt-2 text-3xl font-semibold">{value}</div>
+    <div className="flex flex-wrap items-center gap-3 rounded-md border border-violet-200 bg-violet-50 px-4 py-3 text-sm">
+      <span className="font-semibold text-violet-900">Manual match:</span>
+      <span>{pickedOur ? pickedOur.external_id : "pick an internal row"}</span>
+      <span className="text-slate-400">with</span>
+      <span>{pickedOther ? pickedOther.external_id : "pick an external row"}</span>
+      <div className="ml-auto flex gap-2">
+        <button
+          type="button"
+          onClick={onClear}
+          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 font-medium hover:bg-slate-50"
+        >
+          Clear
+        </button>
+        <button
+          type="button"
+          disabled={!pickedOur || !pickedOther || busy !== ""}
+          onClick={onConfirm}
+          className="rounded-md bg-violet-700 px-3 py-1.5 font-semibold text-white hover:bg-violet-800 disabled:bg-slate-400"
+        >
+          Confirm match
+        </button>
+      </div>
     </div>
   );
 }
 
 function ResultsTable({
+  rows,
+  total,
   filter,
-  filteredResults,
-  hasResults,
-  results,
   setFilter,
+  selectedResultId,
+  onSelect,
 }: {
+  rows: ResultRow[];
+  total: number;
   filter: Filter;
-  filteredResults: ResultRow[];
-  hasResults: boolean;
-  results: ResultRow[];
   setFilter: (filter: Filter) => void;
+  selectedResultId: number | null;
+  onSelect: (id: number) => void;
 }) {
+  const filterButton = (value: Filter, label: string) => (
+    <button
+      type="button"
+      onClick={() => setFilter(value)}
+      className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
+        filter === value
+          ? "border-slate-950 bg-slate-950 text-white"
+          : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+      }`}
+    >
+      {label}
+    </button>
+  );
+
   return (
     <div className="overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm">
-      <div className="flex flex-col gap-4 border-b border-slate-200 p-4 lg:flex-row lg:items-center lg:justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 p-4">
         <div>
-          <h2 className="text-lg font-semibold">Review results</h2>
-          <p className="mt-1 text-sm text-slate-500">
-            {filteredResults.length} of {results.length} rows shown
+          <h2 className="text-base font-semibold">Results</h2>
+          <p className="text-sm text-slate-500">
+            {rows.length} of {total} rows. Click a row to inspect it.
           </p>
         </div>
-
-        <div className="flex flex-wrap gap-2">
-          {filterOptions.map((option) => (
-            <button
-              key={option.value}
-              type="button"
-              onClick={() => setFilter(option.value)}
-              className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
-                filter === option.value
-                  ? "border-slate-950 bg-slate-950 text-white"
-                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-              }`}
-            >
-              {option.label}
-            </button>
-          ))}
+        <div className="flex gap-2">
+          {filterButton("ATTENTION", "Needs attention")}
+          {filterButton("ALL", "All")}
         </div>
       </div>
 
-      {hasResults ? (
+      {rows.length === 0 ? (
+        <p className="px-4 py-10 text-center text-sm text-slate-500">Nothing to show.</p>
+      ) : (
         <div className="overflow-x-auto">
-          <table className="min-w-[980px] divide-y divide-slate-200 text-sm">
+          <table className="min-w-215 w-full text-sm">
             <thead className="bg-slate-50 text-left text-xs font-semibold uppercase text-slate-500">
               <tr>
-                <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">Internal trade</th>
-                <th className="px-4 py-3">External trade</th>
-                <th className="px-4 py-3">Instrument</th>
-                <th className="px-4 py-3 text-right">Qty</th>
-                <th className="px-4 py-3 text-right">Internal price</th>
-                <th className="px-4 py-3 text-right">External price</th>
-                <th className="px-4 py-3 text-right">Delta</th>
+                <th className="px-4 py-2">Status</th>
+                <th className="px-4 py-2">Internal</th>
+                <th className="px-4 py-2">External</th>
+                <th className="px-4 py-2">Trade</th>
+                <th className="px-4 py-2">What differs</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100 bg-white">
-              {filteredResults.map((row) => (
-                <ResultTableRow key={row.result_id} row={row} />
-              ))}
+            <tbody className="divide-y divide-slate-100">
+              {rows.map((row) => {
+                const trade = row.our_transaction ?? row.other_transaction;
+                return (
+                  <tr
+                    key={row.result_id}
+                    onClick={() => onSelect(row.result_id)}
+                    className={`cursor-pointer hover:bg-slate-50 ${
+                      row.result_id === selectedResultId ? "bg-slate-100" : ""
+                    }`}
+                  >
+                    <td className="px-4 py-2.5">
+                      <StatusBadge status={row.status} />
+                    </td>
+                    <td className="px-4 py-2.5 font-medium">
+                      {row.our_transaction?.external_id ?? <span className="text-slate-400">none</span>}
+                    </td>
+                    <td className="px-4 py-2.5 font-medium">
+                      {row.other_transaction?.external_id ?? <span className="text-slate-400">none</span>}
+                    </td>
+                    <td className="px-4 py-2.5 text-slate-600">
+                      {trade?.side} {formatValue(trade?.quantity)} {trade?.instrument} @ {formatValue(trade?.price)}
+                    </td>
+                    <td className="px-4 py-2.5 text-amber-700">
+                      {row.differences.map((d) => `${d.field_name} ${formatGap(d)}`).join(", ")}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>
-      ) : (
-        <EmptyResults />
       )}
     </div>
   );
 }
 
-function ResultTableRow({ row }: { row: ResultRow }) {
-  const ourTransaction = row.our_transaction;
-  const otherTransaction = row.other_transaction;
-  const transaction = ourTransaction ?? otherTransaction;
-  const priceDifference = getPriceDifference(row);
-
+function StatusBadge({ status }: { status: Status }) {
   return (
-    <tr className="align-top hover:bg-slate-50">
-      <td className="px-4 py-4">
-        <StatusBadge status={row.status} />
-      </td>
-      <td className="px-4 py-4">
-        <TransactionCell transaction={ourTransaction} />
-      </td>
-      <td className="px-4 py-4">
-        <TransactionCell transaction={otherTransaction} />
-      </td>
-      <td className="px-4 py-4">
-        <div className="font-semibold text-slate-900">
-          {transaction?.instrument ?? "-"}
-        </div>
-        <div className="mt-1 text-xs text-slate-500">
-          {transaction?.side ?? "-"}
-        </div>
-      </td>
-      <td className="px-4 py-4 text-right font-medium">
-        {formatNumber(transaction?.quantity)}
-      </td>
-      <td className="px-4 py-4 text-right">{formatMoney(ourTransaction?.price)}</td>
-      <td className="px-4 py-4 text-right">
-        {formatMoney(otherTransaction?.price)}
-      </td>
-      <td
-        className={`px-4 py-4 text-right font-semibold ${
-          priceDifference ? "text-amber-700" : "text-slate-500"
-        }`}
-      >
-        {priceDifference === undefined ? "-" : formatMoney(priceDifference)}
-      </td>
-    </tr>
-  );
-}
-
-function StatusBadge({ status }: { status: ResultRow["status"] }) {
-  const styles: Record<ResultRow["status"], string> = {
-    MATCHED: "bg-emerald-100 text-emerald-800",
-    DIFFERENCE: "bg-amber-100 text-amber-800",
-    MISSING_ON_OTHER_SIDE: "bg-red-100 text-red-800",
-    MISSING_ON_OUR_SIDE: "bg-sky-100 text-sky-800",
-  };
-
-  return (
-    <span
-      className={`inline-flex rounded px-2.5 py-1 text-xs font-semibold ${styles[status]}`}
-    >
-      {statusLabels[status]}
+    <span className={`inline-flex rounded px-2 py-0.5 text-xs font-semibold ${STATUS[status].tone}`}>
+      {STATUS[status].label}
     </span>
   );
 }
 
-function TransactionCell({ transaction }: { transaction: Transaction | null }) {
-  if (!transaction) {
-    return <span className="text-slate-400">No record</span>;
-  }
+function RowDetail({
+  row,
+  busy,
+  onAcceptUnpaired,
+  onPickForMatch,
+}: {
+  row: ResultRow;
+  busy: string;
+  onAcceptUnpaired: (transaction: Transaction) => void;
+  onPickForMatch: (row: ResultRow) => void;
+}) {
+  const differenceFor = (field: string) => row.differences.find((d) => d.field_name === field);
+  const unmatched = MISSING.includes(row.status);
+  const lonelyTransaction = row.our_transaction ?? row.other_transaction;
 
   return (
-    <div className="min-w-36">
-      <div className="font-semibold text-slate-900">{transaction.external_id}</div>
-      <div className="mt-1 text-xs text-slate-500">
-        {formatDate(transaction.timestamp)}
+    <div className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <h2 className="text-base font-semibold">Row detail</h2>
+          <StatusBadge status={row.status} />
+        </div>
+        {unmatched && lonelyTransaction && (
+          <div className="flex gap-2">
+            <button
+              type="button"
+              disabled={busy !== ""}
+              onClick={() => onPickForMatch(row)}
+              className="rounded-md border border-violet-300 bg-violet-50 px-3 py-1.5 text-sm font-medium text-violet-900 hover:bg-violet-100"
+            >
+              Pick for manual match
+            </button>
+            <button
+              type="button"
+              disabled={busy !== ""}
+              onClick={() => onAcceptUnpaired(lonelyTransaction)}
+              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50"
+            >
+              Accept: no pair exists
+            </button>
+          </div>
+        )}
       </div>
+
+      <table className="mt-4 w-full text-sm">
+        <thead className="text-left text-xs font-semibold uppercase text-slate-500">
+          <tr>
+            <th className="py-1.5 pr-4">Field</th>
+            <th className="py-1.5 pr-4">Internal</th>
+            <th className="py-1.5 pr-4">External</th>
+            <th className="py-1.5">Gap</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {FIELDS.map((field) => {
+            const difference = differenceFor(field.key);
+            return (
+              <tr key={field.key} className={difference ? "bg-amber-50" : ""}>
+                <td className="py-2 pr-4 font-medium text-slate-600">{field.label}</td>
+                <td className="py-2 pr-4">
+                  <FieldValue transaction={row.our_transaction} field={field.key} />
+                </td>
+                <td className="py-2 pr-4">
+                  <FieldValue transaction={row.other_transaction} field={field.key} />
+                </td>
+                <td className="py-2 font-semibold text-amber-700">
+                  {difference ? formatGap(difference) : ""}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
 
-function EmptyResults() {
+function FieldValue({
+  transaction,
+  field,
+}: {
+  transaction: Transaction | null;
+  field: (typeof FIELDS)[number]["key"];
+}) {
+  if (!transaction) return <span className="text-slate-400">-</span>;
+
+  const previous = transaction.previous_values[field];
   return (
-    <div className="flex min-h-72 items-center justify-center px-6 py-12">
-      <div className="max-w-sm text-center">
-        <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-md bg-slate-100 text-lg font-semibold text-slate-500">
-          CSV
-        </div>
-        <h3 className="mt-4 text-base font-semibold">No results yet</h3>
-        <p className="mt-2 text-sm leading-6 text-slate-500">
-          Upload both files and run reconciliation to populate this review
-          table.
-        </p>
-      </div>
+    <div>
+      {formatValue(transaction[field])}
+      {previous !== undefined && (
+        <div className="text-xs text-slate-500">was {formatValue(previous)} in an earlier run</div>
+      )}
     </div>
   );
 }
