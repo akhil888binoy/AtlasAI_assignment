@@ -49,14 +49,14 @@ type Run = {
 
 type Filter = "ATTENTION" | "ALL" | Status;
 
-const STATUS: Record<Status, { label: string; tone: string }> = {
-  MATCHED: { label: "Matched", tone: "bg-emerald-100 text-emerald-800" },
-  DIFFERENCE: { label: "Difference", tone: "bg-amber-100 text-amber-800" },
-  MISSING_ON_OTHER_SIDE: { label: "Missing external", tone: "bg-red-100 text-red-800" },
-  MISSING_ON_OUR_SIDE: { label: "Missing internal", tone: "bg-sky-100 text-sky-800" },
-  MANUALLY_MATCHED: { label: "Manual match", tone: "bg-violet-100 text-violet-800" },
-  ACCEPTED_UNPAIRED: { label: "Accepted unpaired", tone: "bg-slate-200 text-slate-700" },
-  CANCELLED: { label: "Cancelled", tone: "bg-slate-100 text-slate-500" },
+const STATUS: Record<Status, { label: string; dot: string; badge: string }> = {
+  DIFFERENCE: { label: "Difference", dot: "bg-amber-500", badge: "bg-amber-50 text-amber-800 ring-amber-200" },
+  MISSING_ON_OTHER_SIDE: { label: "Missing external", dot: "bg-red-500", badge: "bg-red-50 text-red-800 ring-red-200" },
+  MISSING_ON_OUR_SIDE: { label: "Missing internal", dot: "bg-sky-500", badge: "bg-sky-50 text-sky-800 ring-sky-200" },
+  MATCHED: { label: "Matched", dot: "bg-emerald-500", badge: "bg-emerald-50 text-emerald-800 ring-emerald-200" },
+  MANUALLY_MATCHED: { label: "Manual match", dot: "bg-violet-500", badge: "bg-violet-50 text-violet-800 ring-violet-200" },
+  ACCEPTED_UNPAIRED: { label: "Accepted", dot: "bg-slate-500", badge: "bg-slate-100 text-slate-700 ring-slate-200" },
+  CANCELLED: { label: "Cancelled", dot: "bg-slate-300", badge: "bg-slate-50 text-slate-500 ring-slate-200" },
 };
 
 const STATUS_ORDER = Object.keys(STATUS) as Status[];
@@ -73,21 +73,35 @@ const FIELDS = [
   { key: "amount", label: "Amount" },
 ] as const;
 
+const FIELD_LABEL = Object.fromEntries(FIELDS.map((f) => [f.key, f.label]));
+
 function formatValue(value: string | number | undefined) {
   if (value === undefined || value === null) return "-";
   if (typeof value === "number") {
     return new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 }).format(value);
   }
-  // Timestamps arrive as ISO strings; show them as sent, no timezone guessing.
-  return value.replace("T", " ").slice(0, 19);
+  return value;
+}
+
+// Timestamps arrive as ISO strings; show them as sent, no timezone guessing.
+function formatTimestamp(value: string | undefined) {
+  return value ? value.replace("T", " ").slice(0, 19) : "-";
+}
+
+function formatTime(value: string | undefined) {
+  return value ? value.slice(11, 19) : "-";
 }
 
 function formatGap(difference: Difference) {
+  const sign = difference.difference > 0 ? "+" : "";
   if (difference.field_name === "timestamp") {
-    const minutes = difference.difference / 60;
-    return `${minutes > 0 ? "+" : ""}${formatValue(minutes)} min`;
+    return `${sign}${formatValue(difference.difference / 60)} min`;
   }
-  return `${difference.difference > 0 ? "+" : ""}${formatValue(difference.difference)}`;
+  return `${sign}${formatValue(difference.difference)}`;
+}
+
+function describeDifferences(row: ResultRow) {
+  return row.differences.map((d) => `${FIELD_LABEL[d.field_name]} ${formatGap(d)}`).join(" · ");
 }
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
@@ -121,6 +135,7 @@ function Reconciliation() {
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
 
+  const run = runs.find((r) => r.id === runId) ?? null;
   const selectedRow = results.find((row) => row.result_id === selectedResultId) ?? null;
 
   const visibleRows = results.filter((row) => {
@@ -133,6 +148,7 @@ function Reconciliation() {
     acc[row.status] = (acc[row.status] ?? 0) + 1;
     return acc;
   }, {});
+  const openCount = NEEDS_ATTENTION.reduce((sum, status) => sum + (counts[status] ?? 0), 0);
 
   async function loadRuns() {
     const data = await api<Run[]>("/runs");
@@ -142,11 +158,13 @@ function Reconciliation() {
 
   async function openRun(id: number) {
     setRunId(id);
-    setSelectedResultId(null);
     setPickedOur(null);
     setPickedOther(null);
     const data = await api<{ results: ResultRow[] }>(`/${id}/results`);
     setResults(data.results);
+    // Land on the first row that needs a decision.
+    const first = data.results.find((row) => NEEDS_ATTENTION.includes(row.status));
+    setSelectedResultId(first?.result_id ?? null);
   }
 
   // Refresh the current run's rows after a hand resolution.
@@ -200,6 +218,11 @@ function Reconciliation() {
     if (row.other_transaction) setPickedOther(row.other_transaction);
   }
 
+  function clearPicks() {
+    setPickedOur(null);
+    setPickedOther(null);
+  }
+
   function confirmManualMatch() {
     if (!pickedOur || !pickedOther) return;
     return withBusy("Matching...", async () => {
@@ -207,86 +230,149 @@ function Reconciliation() {
         our_transaction_id: pickedOur.id,
         other_transaction_id: pickedOther.id,
       });
-      setPickedOur(null);
-      setPickedOther(null);
+      clearPicks();
       setSelectedResultId(null);
       await refreshResults();
     });
   }
 
   return (
-    <main className="min-h-screen bg-[#f7f8fb] text-slate-950">
+    <main className="min-h-screen bg-slate-50 text-slate-900">
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto max-w-7xl px-5 py-6 sm:px-8">
-          <h1 className="text-2xl font-semibold">Transaction reconciliation</h1>
-          <p className="mt-1 text-sm text-slate-600">
-            Upload today's ledger and statement, then work through the rows that do not agree.
-          </p>
+        <div className="mx-auto flex max-w-375 items-center justify-between px-6 py-3">
+          <div className="flex items-center gap-3">
+            <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-indigo-600 text-sm font-bold text-white">
+              R
+            </span>
+            <span className="text-base font-semibold">Reconciliation</span>
+          </div>
+          {busy && <span className="text-sm text-slate-500">{busy}</span>}
         </div>
       </header>
 
-      <div className="mx-auto grid max-w-7xl gap-6 px-5 py-6 sm:px-8 lg:grid-cols-[320px_1fr]">
+      <div className="mx-auto grid max-w-375 gap-6 px-6 py-6 lg:grid-cols-[280px_1fr]">
         <aside className="space-y-4">
           <UploadForm busy={busy} onSubmit={startRun} />
           <RunList runs={runs} activeRunId={runId} onOpen={(id) => withBusy("Loading...", () => openRun(id))} />
         </aside>
 
-        <section className="space-y-4">
+        <section className="min-w-0 space-y-4">
           {error && (
-            <div className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-700">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
               {error}
             </div>
           )}
 
-          {(pickedOur || pickedOther) && (
-            <MatchBar
-              pickedOur={pickedOur}
-              pickedOther={pickedOther}
-              busy={busy}
-              onConfirm={confirmManualMatch}
-              onClear={() => {
-                setPickedOur(null);
-                setPickedOther(null);
-              }}
-            />
+          {run ? (
+            <RunHeading run={run} openCount={openCount} />
+          ) : (
+            <EmptyState />
           )}
 
-          <div className="grid gap-3 sm:grid-cols-3 xl:grid-cols-7">
-            {STATUS_ORDER.map((status) => (
-              <button
-                key={status}
-                type="button"
-                onClick={() => setFilter(status)}
-                className={`rounded-md border p-3 text-left shadow-sm ${
-                  filter === status ? "border-slate-950" : "border-slate-200"
-                } ${STATUS[status].tone}`}
-              >
-                <div className="text-xs font-medium">{STATUS[status].label}</div>
-                <div className="mt-1 text-2xl font-semibold">{counts[status] ?? 0}</div>
-              </button>
-            ))}
-          </div>
+          {run && (
+            <>
+              <StatStrip counts={counts} filter={filter} setFilter={setFilter} total={results.length} />
 
-          <ResultsTable
-            rows={visibleRows}
-            total={results.length}
-            filter={filter}
-            setFilter={setFilter}
-            selectedResultId={selectedResultId}
-            onSelect={setSelectedResultId}
-          />
+              {(pickedOur || pickedOther) && (
+                <MatchBar
+                  pickedOur={pickedOur}
+                  pickedOther={pickedOther}
+                  busy={busy}
+                  onConfirm={confirmManualMatch}
+                  onClear={clearPicks}
+                />
+              )}
 
-          {selectedRow && (
-            <RowDetail
-              row={selectedRow}
-              busy={busy}
-              onAcceptUnpaired={acceptUnpaired}
-              onPickForMatch={pickForMatch}
-            />
+              <div className="grid items-start gap-4 xl:grid-cols-[1fr_360px]">
+                <ResultsTable
+                  rows={visibleRows}
+                  selectedResultId={selectedResultId}
+                  onSelect={setSelectedResultId}
+                />
+                {selectedRow ? (
+                  <RowDetail
+                    row={selectedRow}
+                    busy={busy}
+                    onAcceptUnpaired={acceptUnpaired}
+                    onPickForMatch={pickForMatch}
+                  />
+                ) : (
+                  <div className="rounded-lg border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
+                    Select a row to see both sides field by field.
+                  </div>
+                )}
+              </div>
+            </>
           )}
         </section>
       </div>
     </main>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="rounded-lg border border-dashed border-slate-300 bg-white p-12 text-center">
+      <h2 className="text-lg font-semibold">No runs yet</h2>
+      <p className="mt-2 text-sm text-slate-500">
+        Upload today's ledger and the counterparty statement to start the first run.
+      </p>
+    </div>
+  );
+}
+
+function RunHeading({ run, openCount }: { run: Run; openCount: number }) {
+  return (
+    <div className="flex flex-wrap items-end justify-between gap-3">
+      <div>
+        <h1 className="text-2xl font-semibold tracking-tight">Run #{run.id}</h1>
+        <p className="mt-1 text-sm text-slate-500">
+          {formatTimestamp(run.created_at)} · {run.our_file} against {run.other_file}
+        </p>
+      </div>
+      <p className={`text-sm font-medium ${openCount > 0 ? "text-amber-700" : "text-emerald-700"}`}>
+        {openCount === 0 ? "Everything is resolved" : `${openCount} ${openCount === 1 ? "row needs" : "rows need"} a decision`}
+      </p>
+    </div>
+  );
+}
+
+function StatStrip({
+  counts,
+  filter,
+  setFilter,
+  total,
+}: {
+  counts: Partial<Record<Status, number>>;
+  filter: Filter;
+  setFilter: (filter: Filter) => void;
+  total: number;
+}) {
+  const cell = (value: Filter, label: string, count: number, dot?: string) => (
+    <button
+      key={value}
+      type="button"
+      onClick={() => setFilter(value)}
+      className={`flex flex-1 flex-col gap-1 whitespace-nowrap border-b-2 px-4 py-3 text-left hover:bg-slate-50 ${
+        filter === value ? "border-indigo-600 bg-indigo-50/40" : "border-transparent"
+      }`}
+    >
+      <span className="flex items-center gap-1.5 text-xs font-medium text-slate-500">
+        {dot && <span className={`h-2 w-2 rounded-full ${dot}`} />}
+        {label}
+      </span>
+      <span className="text-2xl font-semibold tabular-nums">{count}</span>
+    </button>
+  );
+
+  const openCount = NEEDS_ATTENTION.reduce((sum, status) => sum + (counts[status] ?? 0), 0);
+
+  return (
+    <div className="flex overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+      {cell("ATTENTION", "Needs attention", openCount)}
+      {STATUS_ORDER.map((status) => cell(status, STATUS[status].label, counts[status] ?? 0, STATUS[status].dot))}
+      {cell("ALL", "All rows", total)}
+    </div>
   );
 }
 
@@ -306,9 +392,9 @@ function UploadForm({
         event.preventDefault();
         if (ourFile && otherFile) onSubmit(ourFile, otherFile);
       }}
-      className="rounded-md border border-slate-200 bg-white p-4 shadow-sm"
+      className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm"
     >
-      <h2 className="text-base font-semibold">Start a run</h2>
+      <h2 className="text-sm font-semibold">New run</h2>
       <div className="mt-3 space-y-2">
         <FilePicker id="our-file" label="Our ledger" file={ourFile} onChange={setOurFile} />
         <FilePicker id="other-file" label="Their statement" file={otherFile} onChange={setOtherFile} />
@@ -316,7 +402,7 @@ function UploadForm({
       <button
         type="submit"
         disabled={busy !== "" || !ourFile || !otherFile}
-        className="mt-4 w-full rounded-md bg-slate-950 px-4 py-2.5 text-sm font-semibold text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+        className="mt-3 w-full rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-300"
       >
         {busy || "Upload and reconcile"}
       </button>
@@ -338,10 +424,14 @@ function FilePicker({
   return (
     <label
       htmlFor={id}
-      className="block cursor-pointer rounded-md border border-dashed border-slate-300 bg-slate-50 px-3 py-2.5 hover:border-slate-400 hover:bg-white"
+      className={`block cursor-pointer rounded-md border px-3 py-2 hover:border-indigo-400 ${
+        file ? "border-indigo-300 bg-indigo-50/50" : "border-dashed border-slate-300 bg-slate-50"
+      }`}
     >
-      <div className="text-sm font-semibold text-slate-800">{label}</div>
-      <div className="mt-0.5 truncate text-sm text-slate-500">{file ? file.name : "Choose a CSV file"}</div>
+      <div className="text-xs font-medium text-slate-500">{label}</div>
+      <div className="mt-0.5 truncate text-sm font-medium text-slate-800">
+        {file ? file.name : "Choose a CSV file"}
+      </div>
       <input
         id={id}
         type="file"
@@ -363,31 +453,28 @@ function RunList({
   onOpen: (id: number) => void;
 }) {
   return (
-    <div className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="text-base font-semibold">Previous runs</h2>
-      {runs.length === 0 && <p className="mt-2 text-sm text-slate-500">No runs yet.</p>}
-      <ul className="mt-3 space-y-2">
+    <div className="rounded-lg border border-slate-200 bg-white shadow-sm">
+      <h2 className="border-b border-slate-200 px-4 py-3 text-sm font-semibold">Runs</h2>
+      {runs.length === 0 && <p className="px-4 py-6 text-sm text-slate-500">No runs yet.</p>}
+      <ul className="max-h-[60vh] divide-y divide-slate-100 overflow-y-auto">
         {runs.map((run) => {
           const open = NEEDS_ATTENTION.reduce((sum, status) => sum + (run.summary[status] ?? 0), 0);
+          const active = run.id === activeRunId;
           return (
             <li key={run.id}>
               <button
                 type="button"
                 onClick={() => onOpen(run.id)}
-                className={`w-full rounded-md border px-3 py-2 text-left text-sm hover:bg-slate-50 ${
-                  run.id === activeRunId ? "border-slate-950 bg-slate-50" : "border-slate-200"
+                className={`flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm hover:bg-slate-50 ${
+                  active ? "bg-indigo-50/60" : ""
                 }`}
               >
-                <div className="flex justify-between font-semibold">
-                  <span>Run #{run.id}</span>
-                  <span className={open > 0 ? "text-amber-700" : "text-emerald-700"}>
-                    {open} open
-                  </span>
-                </div>
-                <div className="mt-0.5 text-xs text-slate-500">{formatValue(run.created_at)}</div>
-                <div className="mt-0.5 truncate text-xs text-slate-500">
-                  {run.our_file} + {run.other_file}
-                </div>
+                <span className={`h-2 w-2 shrink-0 rounded-full ${open > 0 ? "bg-amber-500" : "bg-emerald-500"}`} />
+                <span className="min-w-0 flex-1">
+                  <span className={`block font-medium ${active ? "text-indigo-700" : ""}`}>Run #{run.id}</span>
+                  <span className="block truncate text-xs text-slate-500">{formatTimestamp(run.created_at)}</span>
+                </span>
+                <span className="text-xs tabular-nums text-slate-500">{open} open</span>
               </button>
             </li>
           );
@@ -410,17 +497,24 @@ function MatchBar({
   onConfirm: () => void;
   onClear: () => void;
 }) {
+  const slot = (transaction: Transaction | null, hint: string) =>
+    transaction ? (
+      <span className="rounded bg-white px-2 py-0.5 font-semibold ring-1 ring-violet-200">{transaction.external_id}</span>
+    ) : (
+      <span className="text-violet-700/70">{hint}</span>
+    );
+
   return (
-    <div className="flex flex-wrap items-center gap-3 rounded-md border border-violet-200 bg-violet-50 px-4 py-3 text-sm">
-      <span className="font-semibold text-violet-900">Manual match:</span>
-      <span>{pickedOur ? pickedOur.external_id : "pick an internal row"}</span>
-      <span className="text-slate-400">with</span>
-      <span>{pickedOther ? pickedOther.external_id : "pick an external row"}</span>
+    <div className="flex flex-wrap items-center gap-3 rounded-lg border border-violet-200 bg-violet-50 px-4 py-3 text-sm">
+      <span className="font-semibold text-violet-900">Manual match</span>
+      {slot(pickedOur, "pick an internal row")}
+      <span className="text-violet-400">↔</span>
+      {slot(pickedOther, "pick an external row")}
       <div className="ml-auto flex gap-2">
         <button
           type="button"
           onClick={onClear}
-          className="rounded-md border border-slate-300 bg-white px-3 py-1.5 font-medium hover:bg-slate-50"
+          className="rounded-md px-3 py-1.5 font-medium text-violet-900 hover:bg-violet-100"
         >
           Clear
         </button>
@@ -428,7 +522,7 @@ function MatchBar({
           type="button"
           disabled={!pickedOur || !pickedOther || busy !== ""}
           onClick={onConfirm}
-          className="rounded-md bg-violet-700 px-3 py-1.5 font-semibold text-white hover:bg-violet-800 disabled:bg-slate-400"
+          className="rounded-md bg-violet-600 px-3 py-1.5 font-semibold text-white hover:bg-violet-700 disabled:bg-slate-300"
         >
           Confirm match
         </button>
@@ -439,102 +533,76 @@ function MatchBar({
 
 function ResultsTable({
   rows,
-  total,
-  filter,
-  setFilter,
   selectedResultId,
   onSelect,
 }: {
   rows: ResultRow[];
-  total: number;
-  filter: Filter;
-  setFilter: (filter: Filter) => void;
   selectedResultId: number | null;
   onSelect: (id: number) => void;
 }) {
-  const filterButton = (value: Filter, label: string) => (
-    <button
-      type="button"
-      onClick={() => setFilter(value)}
-      className={`rounded-md border px-3 py-1.5 text-sm font-medium ${
-        filter === value
-          ? "border-slate-950 bg-slate-950 text-white"
-          : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
-      }`}
-    >
-      {label}
-    </button>
-  );
+  if (rows.length === 0) {
+    return (
+      <div className="rounded-lg border border-slate-200 bg-white p-12 text-center text-sm text-slate-500 shadow-sm">
+        Nothing in this view.
+      </div>
+    );
+  }
 
   return (
-    <div className="overflow-hidden rounded-md border border-slate-200 bg-white shadow-sm">
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 p-4">
-        <div>
-          <h2 className="text-base font-semibold">Results</h2>
-          <p className="text-sm text-slate-500">
-            {rows.length} of {total} rows. Click a row to inspect it.
-          </p>
-        </div>
-        <div className="flex gap-2">
-          {filterButton("ATTENTION", "Needs attention")}
-          {filterButton("ALL", "All")}
-        </div>
-      </div>
-
-      {rows.length === 0 ? (
-        <p className="px-4 py-10 text-center text-sm text-slate-500">Nothing to show.</p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="min-w-215 w-full text-sm">
-            <thead className="bg-slate-50 text-left text-xs font-semibold uppercase text-slate-500">
-              <tr>
-                <th className="px-4 py-2">Status</th>
-                <th className="px-4 py-2">Internal</th>
-                <th className="px-4 py-2">External</th>
-                <th className="px-4 py-2">Trade</th>
-                <th className="px-4 py-2">What differs</th>
+    <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white shadow-sm">
+      <table className="w-full text-sm">
+        <thead className="border-b border-slate-200 bg-slate-50 text-left text-xs font-medium uppercase tracking-wide text-slate-500">
+          <tr>
+            <th className="px-4 py-2.5">Status</th>
+            <th className="px-3 py-2.5">Internal</th>
+            <th className="px-3 py-2.5">External</th>
+            <th className="px-3 py-2.5">Time</th>
+            <th className="px-3 py-2.5">Trade</th>
+            <th className="px-4 py-2.5">What differs</th>
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-slate-100">
+          {rows.map((row) => {
+            const trade = row.our_transaction ?? row.other_transaction;
+            const selected = row.result_id === selectedResultId;
+            return (
+              <tr
+                key={row.result_id}
+                onClick={() => onSelect(row.result_id)}
+                className={`cursor-pointer ${selected ? "bg-indigo-50" : "hover:bg-slate-50"}`}
+              >
+                <td className="px-4 py-2.5">
+                  <StatusBadge status={row.status} />
+                </td>
+                <td className="whitespace-nowrap px-3 py-2.5 font-medium">
+                  {row.our_transaction?.external_id ?? <span className="font-normal text-slate-400">none</span>}
+                </td>
+                <td className="whitespace-nowrap px-3 py-2.5 font-medium">
+                  {row.other_transaction?.external_id ?? <span className="font-normal text-slate-400">none</span>}
+                </td>
+                <td className="px-3 py-2.5 tabular-nums text-slate-500">{formatTime(trade?.timestamp)}</td>
+                <td className="whitespace-nowrap px-3 py-2.5">
+                  <span className={trade?.side === "BUY" ? "text-emerald-700" : "text-red-700"}>{trade?.side}</span>{" "}
+                  <span className="tabular-nums">{formatValue(trade?.quantity)}</span> {trade?.instrument}
+                  <span className="text-slate-400"> @ </span>
+                  <span className="tabular-nums">{formatValue(trade?.price)}</span>
+                </td>
+                <td className="px-4 py-2.5 text-amber-700">{describeDifferences(row)}</td>
               </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {rows.map((row) => {
-                const trade = row.our_transaction ?? row.other_transaction;
-                return (
-                  <tr
-                    key={row.result_id}
-                    onClick={() => onSelect(row.result_id)}
-                    className={`cursor-pointer hover:bg-slate-50 ${
-                      row.result_id === selectedResultId ? "bg-slate-100" : ""
-                    }`}
-                  >
-                    <td className="px-4 py-2.5">
-                      <StatusBadge status={row.status} />
-                    </td>
-                    <td className="px-4 py-2.5 font-medium">
-                      {row.our_transaction?.external_id ?? <span className="text-slate-400">none</span>}
-                    </td>
-                    <td className="px-4 py-2.5 font-medium">
-                      {row.other_transaction?.external_id ?? <span className="text-slate-400">none</span>}
-                    </td>
-                    <td className="px-4 py-2.5 text-slate-600">
-                      {trade?.side} {formatValue(trade?.quantity)} {trade?.instrument} @ {formatValue(trade?.price)}
-                    </td>
-                    <td className="px-4 py-2.5 text-amber-700">
-                      {row.differences.map((d) => `${d.field_name} ${formatGap(d)}`).join(", ")}
-                    </td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        </div>
-      )}
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
 
 function StatusBadge({ status }: { status: Status }) {
   return (
-    <span className={`inline-flex rounded px-2 py-0.5 text-xs font-semibold ${STATUS[status].tone}`}>
+    <span
+      className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium ring-1 ${STATUS[status].badge}`}
+    >
+      <span className={`h-1.5 w-1.5 rounded-full ${STATUS[status].dot}`} />
       {STATUS[status].label}
     </span>
   );
@@ -556,63 +624,62 @@ function RowDetail({
   const lonelyTransaction = row.our_transaction ?? row.other_transaction;
 
   return (
-    <div className="rounded-md border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-3">
-          <h2 className="text-base font-semibold">Row detail</h2>
-          <StatusBadge status={row.status} />
-        </div>
-        {unmatched && lonelyTransaction && (
-          <div className="flex gap-2">
-            <button
-              type="button"
-              disabled={busy !== ""}
-              onClick={() => onPickForMatch(row)}
-              className="rounded-md border border-violet-300 bg-violet-50 px-3 py-1.5 text-sm font-medium text-violet-900 hover:bg-violet-100"
-            >
-              Pick for manual match
-            </button>
-            <button
-              type="button"
-              disabled={busy !== ""}
-              onClick={() => onAcceptUnpaired(lonelyTransaction)}
-              className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-sm font-medium hover:bg-slate-50"
-            >
-              Accept: no pair exists
-            </button>
-          </div>
-        )}
+    <div className="rounded-lg border border-slate-200 bg-white shadow-sm xl:sticky xl:top-6">
+      <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+        <h2 className="text-sm font-semibold">Row detail</h2>
+        <StatusBadge status={row.status} />
       </div>
 
-      <table className="mt-4 w-full text-sm">
-        <thead className="text-left text-xs font-semibold uppercase text-slate-500">
-          <tr>
-            <th className="py-1.5 pr-4">Field</th>
-            <th className="py-1.5 pr-4">Internal</th>
-            <th className="py-1.5 pr-4">External</th>
-            <th className="py-1.5">Gap</th>
-          </tr>
-        </thead>
-        <tbody className="divide-y divide-slate-100">
-          {FIELDS.map((field) => {
-            const difference = differenceFor(field.key);
-            return (
-              <tr key={field.key} className={difference ? "bg-amber-50" : ""}>
-                <td className="py-2 pr-4 font-medium text-slate-600">{field.label}</td>
-                <td className="py-2 pr-4">
-                  <FieldValue transaction={row.our_transaction} field={field.key} />
-                </td>
-                <td className="py-2 pr-4">
-                  <FieldValue transaction={row.other_transaction} field={field.key} />
-                </td>
-                <td className="py-2 font-semibold text-amber-700">
-                  {difference ? formatGap(difference) : ""}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+      <div className="grid grid-cols-[88px_1fr_1fr] border-b border-slate-100 bg-slate-50 px-4 py-2 text-xs font-medium uppercase tracking-wide text-slate-500">
+        <span>Field</span>
+        <span>Internal</span>
+        <span>External</span>
+      </div>
+
+      <div className="divide-y divide-slate-100">
+        {FIELDS.map((field) => {
+          const difference = differenceFor(field.key);
+          return (
+            <div key={field.key} className={`px-4 py-2.5 ${difference ? "bg-amber-50" : ""}`}>
+              <div className="grid grid-cols-[88px_1fr_1fr] gap-2 text-sm">
+                <span className="text-slate-500">{field.label}</span>
+                <FieldValue transaction={row.our_transaction} field={field.key} />
+                <FieldValue transaction={row.other_transaction} field={field.key} />
+              </div>
+              {difference && (
+                <div className="mt-1 pl-24 text-xs font-semibold text-amber-700">
+                  differs by {formatGap(difference)}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {unmatched && lonelyTransaction && (
+        <div className="space-y-2 border-t border-slate-200 p-4">
+          <p className="text-xs text-slate-500">
+            This row has no pair. Match it with a row on the other side, or accept that none exists.
+            Either decision is remembered for future runs.
+          </p>
+          <button
+            type="button"
+            disabled={busy !== ""}
+            onClick={() => onPickForMatch(row)}
+            className="w-full rounded-md bg-violet-600 px-3 py-2 text-sm font-semibold text-white hover:bg-violet-700 disabled:bg-slate-300"
+          >
+            Pick for manual match
+          </button>
+          <button
+            type="button"
+            disabled={busy !== ""}
+            onClick={() => onAcceptUnpaired(lonelyTransaction)}
+            className="w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50"
+          >
+            Accept: no pair exists
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -624,16 +691,18 @@ function FieldValue({
   transaction: Transaction | null;
   field: (typeof FIELDS)[number]["key"];
 }) {
-  if (!transaction) return <span className="text-slate-400">-</span>;
+  if (!transaction) return <span className="text-slate-300">—</span>;
 
+  const show = (value: string | number | undefined) =>
+    field === "timestamp" ? formatTimestamp(String(value)) : formatValue(value);
   const previous = transaction.previous_values[field];
   return (
-    <div>
-      {formatValue(transaction[field])}
+    <span className="min-w-0 wrap-break-word tabular-nums">
+      {show(transaction[field])}
       {previous !== undefined && (
-        <div className="text-xs text-slate-500">was {formatValue(previous)} in an earlier run</div>
+        <span className="block text-xs font-normal text-slate-500">was {show(previous)}</span>
       )}
-    </div>
+    </span>
   );
 }
 

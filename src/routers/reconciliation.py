@@ -199,6 +199,22 @@ def get_unmatched_result(db, run_id, transaction_id):
     return result
 
 
+def save_decision(db, our_external_id, other_external_id, resolved_by):
+    """Store a hand decision once. Making the same decision again on a later run is a no-op."""
+    exists = (
+        db.query(ManualDecision)
+        .filter_by(our_external_id=our_external_id, other_external_id=other_external_id)
+        .first()
+    )
+    if exists is None:
+        db.add(ManualDecision(
+            our_external_id=our_external_id,
+            other_external_id=other_external_id,
+            resolved_by=resolved_by,
+            resolved_at=datetime.utcnow(),
+        ))
+
+
 @router.post("/{run_id}/manual-match")
 def manual_match(
     run_id: int,
@@ -215,12 +231,7 @@ def manual_match(
     if our is None or other is None:
         raise HTTPException(status_code=400, detail="Pick one row from each side.")
 
-    db.add(ManualDecision(
-        our_external_id=our.external_id,
-        other_external_id=other.external_id,
-        resolved_by=resolved_by,
-        resolved_at=datetime.utcnow(),
-    ))
+    save_decision(db, our.external_id, other.external_id, resolved_by)
 
     our_result.other_transaction_id = other.id
     our_result.status = "MANUALLY_MATCHED"
@@ -242,12 +253,10 @@ def accept_unpaired(
     result = get_unmatched_result(db, run_id, transaction_id)
     transaction = result.our_transaction or result.other_transaction
 
-    decision = ManualDecision(resolved_by=resolved_by, resolved_at=datetime.utcnow())
     if transaction.source == "OUR_LEDGER":
-        decision.our_external_id = transaction.external_id
+        save_decision(db, transaction.external_id, None, resolved_by)
     else:
-        decision.other_external_id = transaction.external_id
-    db.add(decision)
+        save_decision(db, None, transaction.external_id, resolved_by)
 
     result.status = "ACCEPTED_UNPAIRED"
     db.commit()

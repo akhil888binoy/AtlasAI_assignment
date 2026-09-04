@@ -126,6 +126,17 @@ class ReconciliationRouteTests(unittest.TestCase):
         results = self.results_by_status(next_run_id)
         self.assertEqual(results["ACCEPTED_UNPAIRED"][0]["other_transaction"]["external_id"], "X-5")
 
+    def test_accepting_the_same_trade_in_two_runs_stores_one_decision(self):
+        first_run = self.run_files()
+        second_run = self.run_files(our_csv=CORRECTED_LEDGER_CSV)
+
+        for run_id in (first_run, second_run):
+            other_id = self.results_by_status(run_id)["MISSING_ON_OUR_SIDE"][0]["other_transaction"]["id"]
+            api.accept_unpaired(run_id, transaction_id=other_id, resolved_by="tester", db=self.db)
+
+        decisions = self.db.query(api.ManualDecision).filter_by(other_external_id="X-5").count()
+        self.assertEqual(decisions, 1)
+
     def test_resolving_a_matched_row_is_refused(self):
         run_id = self.run_files()
         matched_id = self.results_by_status(run_id)["MATCHED"][0]["our_transaction"]["id"]
